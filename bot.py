@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -22,8 +22,22 @@ from telegram.ext import (
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
-TELEGRAM_VIDEO_LIMIT_BYTES = 50 * 1024 * 1024
+DEFAULT_MAX_VIDEO_MB = 50
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+
+
+def resolve_max_video_limit_bytes() -> tuple[int, int]:
+    raw_value = os.getenv("MAX_VIDEO_MB", str(DEFAULT_MAX_VIDEO_MB))
+    try:
+        max_video_mb = max(1, int(raw_value))
+    except ValueError:
+        logging.warning(
+            "Некорректный MAX_VIDEO_MB=%r, использую значение по умолчанию %s МБ",
+            raw_value,
+            DEFAULT_MAX_VIDEO_MB,
+        )
+        max_video_mb = DEFAULT_MAX_VIDEO_MB
+    return max_video_mb, max_video_mb * 1024 * 1024
 
 
 def setup_logging() -> None:
@@ -40,36 +54,84 @@ def is_url_message(text: Optional[str]) -> bool:
     return text.startswith("http://") or text.startswith("https://")
 
 
-def _download_video_sync(url: str, tmp_dir: Path) -> Tuple[Path, int]:
-    file_id = uuid.uuid4().hex
-    output_template = str(tmp_dir / f"{file_id}.%(ext)s")
 
-    ydl_opts = {
+
+def _base_ydl_opts(output_template: str, max_filesize_bytes: int) -> dict[str, Any]:
+    return {
         "outtmpl": output_template,
         "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
-        "max_filesize": TELEGRAM_VIDEO_LIMIT_BYTES,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "retries": 3,
+        "extractor_retries": 3,
+        "socket_timeout": 20,
+        "max_filesize": max_filesize_bytes,
+        # TikTok и часть CDN лучше отвечают при явном User-Agent
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            )
+        },
     }
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if info is None:
-            raise DownloadError("yt-dlp не вернул информацию о видео.")
 
-        candidates = sorted(
-            tmp_dir.glob(f"{file_id}.*"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if not candidates:
-            raise FileNotFoundError("Файл после скачивания не найден.")
+def _tiktok_fallback_ydl_opts(output_template: str, max_filesize_bytes: int) -> dict[str, Any]:
+    opts = _base_ydl_opts(output_template, max_filesize_bytes)
+    opts.update(
+        {
+            # Иногда комбинированные форматы для TikTok недоступны; пробуем проще
+            "format": "best",
+            "extractor_args": {
+                # Часто помогает обойти нестабильность web-эндпоинтов TikTok
+                "tiktok": {"api_hostname": ["api16-normal-c-useast1a.tiktokv.com"]}
+            },
+            "http_headers": {
+                **opts["http_headers"],
+                "Referer": "https://www.tiktok.com/",
+            },
+        }
+    )
+    return opts
 
-        video_path = candidates[0]
-        size_bytes = video_path.stat().st_size
-        return video_path, size_bytes
+
+def _find_downloaded_file(tmp_dir: Path, file_id: str) -> Path:
+    candidates = sorted(
+        tmp_dir.glob(f"{file_id}.*"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise FileNotFoundError("Файл после скачивания не найден.")
+    return candidates[0]
+
+def _download_video_sync(url: str, tmp_dir: Path, max_filesize_bytes: int) -> Tuple[Path, int]:
+    file_id = uuid.uuid4().hex
+    output_template = str(tmp_dir / f"{file_id}.%(ext)s")
+
+    # Первая попытка: универсальные настройки
+    try:
+        with YoutubeDL(_base_ydl_opts(output_template, max_filesize_bytes)) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info is None:
+                raise DownloadError("yt-dlp не вернул информацию о видео.")
+    except DownloadError:
+        # Вторая попытка специально для TikTok
+        if "tiktok.com" not in url.lower():
+            raise
+
+        logging.warning("Первая попытка для TikTok не удалась, запускаю fallback-режим")
+        with YoutubeDL(_tiktok_fallback_ydl_opts(output_template, max_filesize_bytes)) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info is None:
+                raise DownloadError("yt-dlp не вернул информацию о видео.")
+
+    video_path = _find_downloaded_file(tmp_dir, file_id)
+    size_bytes = video_path.stat().st_size
+    return video_path, size_bytes
 
 
 def cleanup_temp(path: Path) -> None:
@@ -99,7 +161,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         "Отправь ссылку вида http://... или https://...\n"
         "Я скачаю видео и отправлю его в чат.\n\n"
-        "Ограничение: файл должен быть не больше 50 МБ."
+        f"Ограничение: файл должен быть не больше {context.application.bot_data.get('max_video_mb', DEFAULT_MAX_VIDEO_MB)} МБ."
     )
 
 
@@ -128,15 +190,16 @@ async def url_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             _download_video_sync,
             text,
             temp_dir,
+            context.application.bot_data["max_video_bytes"],
         )
 
         ext = downloaded_file.suffix.lower()
         if ext and ext not in ALLOWED_EXTENSIONS:
             logging.warning("Нестандартный формат %s, пробую отправить как есть", ext)
 
-        if file_size > TELEGRAM_VIDEO_LIMIT_BYTES:
+        if file_size > context.application.bot_data["max_video_bytes"]:
             await message.reply_text(
-                "Видео больше 50 МБ, Telegram-бот не может его отправить. "
+                f"Видео больше {context.application.bot_data['max_video_mb']} МБ, Telegram-бот не может его отправить. "
                 "Пришлите ссылку на видео меньшего размера."
             )
             return
@@ -174,11 +237,16 @@ def main() -> None:
     setup_logging()
     load_dotenv()
 
+    max_video_mb, max_video_bytes = resolve_max_video_limit_bytes()
+    logging.info("Лимит размера видео: %s МБ", max_video_mb)
+
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("Не задан BOT_TOKEN. Добавьте его в переменные окружения или .env")
 
     app = ApplicationBuilder().token(token).build()
+    app.bot_data["max_video_mb"] = max_video_mb
+    app.bot_data["max_video_bytes"] = max_video_bytes
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, url_message_handler))
